@@ -4,10 +4,14 @@ run-name: Build - ${{ github.ref_name }}
 on:
   push:
     branches:
-      - "**"
-    tags:
-      - "**"
-
+      - dev
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "要构建的分支、tag 或 commit SHA（留空则用默认分支）"
+        required: false
+        default: ""
+        type: string
 env:
   CI: "true"
   JAVA_DISTRIBUTION: "oracle"
