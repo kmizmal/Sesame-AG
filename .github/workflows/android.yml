@@ -12,6 +12,7 @@ on:
         required: false
         default: ""
         type: string
+
 env:
   CI: "true"
   JAVA_DISTRIBUTION: "oracle"
@@ -23,9 +24,10 @@ env:
   LOCAL_AGP_VERSION: "9.2.1"
   LOCAL_KOTLIN_VERSION: "2.2.10"
   RELEASE_DIR: app/build/outputs/apk/release
+  ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
 
 concurrency:
-  group: build-${{ github.ref }}
+  group: build-${{ github.event_name == 'workflow_dispatch' && inputs.ref != '' && inputs.ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -46,6 +48,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref != '' && inputs.ref || github.ref }}
 
       - name: Validate Project Toolchain Baseline
         shell: bash
@@ -134,11 +137,28 @@ jobs:
             echo "dir=${RELEASE_DIR}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Upload Unsigned APKs
+      - name: Package Encrypted APK Artifact
+        id: package_artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${ARTIFACT_PASSWORD}" ]]; then
+            echo "ARTIFACT_PASSWORD is not set" >&2
+            exit 1
+          fi
+          artifact_path="${RUNNER_TEMP}/Sesame-AG-unsigned-${GITHUB_SHA}.zip"
+          (
+            cd "${RELEASE_DIR}"
+            zip -r -P "${ARTIFACT_PASSWORD}" "${artifact_path}" *.apk
+          )
+          ls -lh "${artifact_path}"
+          echo "artifact_path=${artifact_path}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Encrypted APK Artifact
         uses: actions/upload-artifact@v7
         with:
           name: Sesame-AG-unsigned-${{ github.sha }}
-          path: ${{ env.RELEASE_DIR }}/*.apk
+          path: ${{ steps.package_artifact.outputs.artifact_path }}
           if-no-files-found: error
           archive: false
 
@@ -152,7 +172,5 @@ jobs:
             echo "- 触发: \`${{ github.event_name }}\`"
             echo "- 引用: \`${{ github.ref_name }}\`"
             echo "- 提交: \`${{ github.sha }}\`"
-            echo "- APK 数量: \`${{ steps.collect.outputs.count }}\`"
-            echo "- 产物目录: \`${{ steps.collect.outputs.dir }}\`"
-            echo "- 说明: 未签名，请自行使用 apksigner / signing 工具签名后安装"
+            echo "- 说明: 内含未签名 APK，请自行使用 apksigner 签名后安装"
           } >> "$GITHUB_STEP_SUMMARY"
