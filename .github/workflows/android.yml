@@ -71,7 +71,8 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           architecture: x64
           check-latest: false
-          cache: gradle
+          # 不启用 cache: gradle：它缓存的 ~/.gradle/caches 与 ~/.gradle/wrapper
+          # 与下方 setup-gradle 完全重叠，会产生两份条目并争抢同一批 restore key。
 
       - name: Pin Gradle Java Home
         shell: bash
@@ -99,8 +100,11 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
         with:
-          cache-read-only: false
           gradle-version: wrapper
+          # 保存前清理 Gradle User Home 中不再被引用的条目。缺了这一步，缓存会随
+          # 依赖与 AGP 升级持续膨胀，逼近仓库 10 GB 配额时被整体淘汰，直接退回冷构建。
+          cache-cleanup: on-success
+          # cache-read-only 不显式指定：默认值按分支判定，默认分支可写、其余分支只读。
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew

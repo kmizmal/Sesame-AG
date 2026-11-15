@@ -53,7 +53,8 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           architecture: x64
           check-latest: false
-          cache: gradle
+          # 不启用 cache: gradle：它缓存的路径与下方 setup-gradle 完全重叠，
+          # 会导致同一份 Gradle 依赖被存成两套条目。
 
       - name: Pin Gradle Java Home
         shell: bash
@@ -81,8 +82,9 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
         with:
-          cache-read-only: false
           gradle-version: wrapper
+          # cache-read-only 不显式指定：PR 跑在非默认分支，默认即为只读，
+          # 复用主分支缓存但不再写回，避免临时分支挤占主干可复用的缓存。
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
