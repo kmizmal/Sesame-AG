@@ -28,6 +28,9 @@ import io.github.aoguai.sesameag.util.SerialTaskQueue
 object SystemWakeScheduler {
     private const val TAG = "SystemWakeScheduler"
     private const val MIN_FLEXIBLE_WINDOW_MS = 10 * 60 * 1000L
+
+    /** 降级投递是持续状态而非独立事件；同一 lane 的同类日志按该间隔合并输出。 */
+    private const val DEGRADED_LOG_INTERVAL_MS = 60 * 1000L
     internal const val ACTION_TRIGGER = "io.github.aoguai.sesameag.action.PERSISTENT_SCHEDULE_TRIGGER"
     internal const val EXTRA_SCHEDULE_ID = "schedule_id"
     internal const val EXTRA_PERSISTENT_ALARM_LAUNCH = "persistent_alarm_launch"
@@ -99,7 +102,7 @@ object SystemWakeScheduler {
                             alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, token)
                         } else {
                             alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, token)
-                            Log.record(TAG, "精确闹钟权限不可用，已降级投递[${primary.name}]")
+                            logDegradedDelivery(lane, primary.name)
                         }
                     } else {
                         alarmManager.setWindow(
@@ -150,6 +153,22 @@ object SystemWakeScheduler {
         if (schedule.attemptCount > 0 || schedule.lastError in setOf("launch_pending", "delivery_pending") ||
             PersistentSchedulePrecisionPolicy.isStrict(schedule.precisionPolicy, schedule.kind)
         ) LANE_EXACT else LANE_FLEXIBLE
+
+    /** 每 lane 一个 [上次输出时间, 期间被合并的次数]，把降级投递的持续状态压成一条周期性日志。 */
+    private val degradedLogState = java.util.concurrent.ConcurrentHashMap<Int, LongArray>()
+
+    private fun logDegradedDelivery(lane: Int, name: String) {
+        val state = degradedLogState.getOrPut(lane) { LongArray(2) }
+        synchronized(state) {
+            val now = System.currentTimeMillis()
+            state[1]++
+            if (now - state[0] < DEGRADED_LOG_INTERVAL_MS) return
+            val merged = state[1]
+            state[0] = now
+            state[1] = 0
+            Log.record(TAG, "精确闹钟权限不可用，已降级投递[$name] lane=$lane 期间降级次数=$merged")
+        }
+    }
 
     private fun updateLocalTimer(context: Context, schedules: List<PersistentSchedule>): Boolean {
         if (context.packageName != General.PACKAGE_NAME) return false

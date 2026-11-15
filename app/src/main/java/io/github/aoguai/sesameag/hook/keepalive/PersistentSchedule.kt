@@ -9,6 +9,13 @@ object PersistentScheduleKind {
     const val MODULE_CHILD = "MODULE_CHILD"
 }
 
+/** 页面级/全局调度：到点晚投递只代表系统推迟了唤醒，仍应补执行一次。 */
+internal val GLOBAL_SCHEDULE_KINDS: Set<String> = setOf(
+    PersistentScheduleKind.GLOBAL_POLL,
+    PersistentScheduleKind.GLOBAL_WAKEUP,
+    PersistentScheduleKind.GLOBAL_PREWAKEUP,
+)
+
 object PersistentScheduleState {
     const val SCHEDULED = "SCHEDULED"
     const val QUEUED = "QUEUED"
@@ -88,6 +95,22 @@ data class PersistentSchedule(
 
     fun deadlineAtMs(): Long = firstDueAtMs() + toleranceMs.coerceAtLeast(0L)
 
+    fun isGlobalKind(): Boolean = kind in GLOBAL_SCHEDULE_KINDS
+
+    /**
+     * 全局轮询/唤醒的迟到窗口。
+     *
+     * 缺少精确闹钟权限或处于 Doze 时，系统只保证「不早于」触发，实际投递可能比 [deadlineAtMs]
+     * 晚几十分钟到数小时；这类迟到不是业务过期，应当补执行一次。业务子任务（MODULE_CHILD）
+     * 仍严格按 [deadlineAtMs] 判过期，避免已无意义的收取请求被延迟执行。
+     */
+    fun catchUpDeadlineAtMs(): Long =
+        if (isGlobalKind()) {
+            deadlineAtMs() + PersistentScheduleDefaults.GLOBAL_CATCH_UP_WINDOW_MS
+        } else {
+            deadlineAtMs()
+        }
+
     fun withScheduleState(
         state: String,
         now: Long = System.currentTimeMillis(),
@@ -149,6 +172,9 @@ data class PersistentSchedule(
 
 object PersistentScheduleDefaults {
     const val DEFAULT_TOLERANCE_MS: Long = 10 * 60 * 1000L
+
+    /** 全局轮询/唤醒在 deadline 之后的补执行宽限窗，需覆盖一次 Doze 维护窗口与降级投递延迟。 */
+    const val GLOBAL_CATCH_UP_WINDOW_MS: Long = 6 * 60 * 60 * 1000L
     const val DEFAULT_EXECUTION_WAKELOCK_MS: Long = 2 * 60 * 1000L
     const val TASK_EXECUTION_WAKELOCK_MS: Long = 10 * 60 * 1000L
     const val REOPEN_COOLDOWN_MS: Long = 5 * 60 * 1000L

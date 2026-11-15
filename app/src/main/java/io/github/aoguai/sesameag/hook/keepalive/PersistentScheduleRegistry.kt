@@ -22,6 +22,18 @@ object PersistentScheduleRegistry {
     private const val STORE_KEY = "persistentSchedules"
     private const val RETAIN_FINISHED_MS = 24 * 60 * 60 * 1000L
     private const val MAX_DEFERRED_ATTEMPTS = 3
+
+    /** 全局轮询/唤醒的投递重试上限远高于业务子任务：它们只受补执行宽限窗约束。 */
+    private const val MAX_GLOBAL_DEFERRED_ATTEMPTS = 40
+
+    /** 全局轮询/唤醒在多次投递失败后的退避间隔，避免在 Doze 里高频空转。 */
+    private const val GLOBAL_DEFER_BACKOFF_MS = 5 * 60 * 1000L
+
+    /** QUEUED 表示「已被认领、即将执行」；长时间停留说明入口提前返回，不能一直封死主流程派发。 */
+    private const val STALE_QUEUED_CHILD_MS = 5 * 60 * 1000L
+
+    /** 宿主进程重启后重新排期的延迟，避免与启动期初始化抢资源。 */
+    private const val RECOVERY_RETRY_DELAY_MS = 30 * 1000L
     private val activeModuleChildStates = setOf(
         PersistentScheduleState.QUEUED,
         PersistentScheduleState.RUNNING,
@@ -262,6 +274,7 @@ object PersistentScheduleRegistry {
     fun hasActiveModuleChild(
         ownerUserId: String?,
         sessionEpoch: Long,
+        now: Long = System.currentTimeMillis(),
     ): Boolean {
         val safeOwnerUserId = ownerUserId?.trim().orEmpty()
         if (safeOwnerUserId.isEmpty() || sessionEpoch <= 0L || !ensureStorage()) return false
@@ -269,7 +282,10 @@ object PersistentScheduleRegistry {
                 schedule.kind == PersistentScheduleKind.MODULE_CHILD &&
                 schedule.ownerUserId?.trim() == safeOwnerUserId &&
                 schedule.sessionEpoch == sessionEpoch &&
-                schedule.state in activeModuleChildStates
+                schedule.state in activeModuleChildStates &&
+                // 卡死的 QUEUED 记录不能让主流程派发永久停摆；RUNNING 仍按业务耗时判定。
+                !(schedule.state == PersistentScheduleState.QUEUED &&
+                    now - schedule.updatedAtMs > STALE_QUEUED_CHILD_MS)
         }
     }
 
@@ -327,10 +343,25 @@ object PersistentScheduleRegistry {
             if (schedule.ownerUserId?.trim() == ownerUserId.trim() &&
                 schedule.sessionEpoch == sessionEpoch && schedule.state in activeModuleChildStates
             ) {
-                // QUEUED 也可能已交给 Worker，不能用旧执行态推断 RPC 未提交。
                 StoreAccess.afterTransaction { SystemWakeScheduler.cancelLaunchConfirmationTimeout(schedule.id) }
-                Log.error(TAG, "持久任务因宿主进程退出而中断[${schedule.name}] id=${schedule.id} state=${schedule.state}，保留业务待确认数据")
-                schedule.withFailure("host_process_restarted_unconfirmed", now)
+                if (schedule.isGlobalKind()) {
+                    // 全局轮询/唤醒不是业务子任务：进程退出只代表这次投递被打断，
+                    // 判成 FAILED 会让整条调度链再没有任何闹钟（表现为定时任务永久休眠）。
+                    Log.error(
+                        TAG,
+                        "持久调度因宿主进程重启而重新排期[${schedule.name}] id=${schedule.id} state=${schedule.state}",
+                    )
+                    schedule.copy(
+                        state = PersistentScheduleState.SCHEDULED,
+                        triggerAtMs = maxOf(schedule.firstDueAtMs(), now + RECOVERY_RETRY_DELAY_MS),
+                        updatedAtMs = now,
+                        lastError = "host_process_restarted_requeued",
+                    )
+                } else {
+                    // QUEUED 也可能已交给 Worker，不能用旧执行态推断 RPC 未提交。
+                    Log.error(TAG, "持久任务因宿主进程退出而中断[${schedule.name}] id=${schedule.id} state=${schedule.state}，保留业务待确认数据")
+                    schedule.withFailure("host_process_restarted_unconfirmed", now)
+                }
             } else schedule
         }
         if (recovered != schedules) save(recovered)
@@ -372,7 +403,26 @@ object PersistentScheduleRegistry {
                     scheduleOwnerUserId == safeOwnerUserId &&
                     schedule.sessionEpoch == sessionEpoch
             if (!isCurrentSessionSchedule) {
-                StoreAccess.afterTransaction { SystemWakeScheduler.cancelLaunchConfirmationTimeout(schedule.id) }
+                // 会话轮次换新只代表宿主进程重建；全局轮询/唤醒重绑到当前会话，
+                // 直接丢弃会让下一次轮询根本没有计划可排（节点上就是「定时任务休眠」）。
+                if (scheduleOwnerUserId == safeOwnerUserId &&
+                    schedule.isGlobalKind() &&
+                    schedule.state == PersistentScheduleState.SCHEDULED
+                ) {
+                    Log.record(
+                        TAG,
+                        "持久调度会话已换新，重绑到当前会话[${schedule.name}] ${schedule.sessionEpoch}->$sessionEpoch",
+                    )
+                    retained.add(
+                        schedule.copy(
+                            sessionEpoch = sessionEpoch,
+                            updatedAtMs = now,
+                            lastError = null,
+                        ),
+                    )
+                } else {
+                    StoreAccess.afterTransaction { SystemWakeScheduler.cancelLaunchConfirmationTimeout(schedule.id) }
+                }
                 continue
             }
 
@@ -431,7 +481,7 @@ object PersistentScheduleRegistry {
         val queued = withRegistryLock {
             val schedule = get(id) ?: return@withRegistryLock null
             if (schedule.state != PersistentScheduleState.SCHEDULED ||
-                schedule.triggerAtMs > now || now > schedule.deadlineAtMs() ||
+                schedule.triggerAtMs > now || now > schedule.catchUpDeadlineAtMs() ||
                 schedule.lastError == "launch_pending" || schedule.lastError == "delivery_pending"
             ) return@withRegistryLock null
             updateSchedule(id, source) { it.withQueued(now) }
@@ -465,11 +515,13 @@ object PersistentScheduleRegistry {
         val waiting = withRegistryLock {
             val current = get(expected.id) ?: return@withRegistryLock null
             if (current != expected || current.state != PersistentScheduleState.SCHEDULED ||
-                current.triggerAtMs > now || now > current.deadlineAtMs()
+                current.triggerAtMs > now || now > current.catchUpDeadlineAtMs()
             ) return@withRegistryLock null
             val waiting = current.copy(
-                // 为启动/投递确认预留最多三十秒，避免未确认时反复拉起；不得跨过原任务截止时间。
-                triggerAtMs = minOf(now + 30_000L, current.deadlineAtMs()),
+                // 为启动/投递确认预留最多三十秒，避免未确认时反复拉起；不得跨过原任务的补执行窗口。
+                // 已经迟到时仍保证不小于一秒的确认窗口，否则会被压到「现在」形成热循环。
+                triggerAtMs = minOf(now + 30_000L, current.catchUpDeadlineAtMs())
+                    .coerceAtLeast(now + 1_000L),
                 lastFireAtMs = current.firstDueAtMs(),
                 updatedAtMs = now,
                 lastError = if (launching) "launch_pending" else "delivery_pending",
@@ -493,11 +545,16 @@ object PersistentScheduleRegistry {
         if (schedule.state != PersistentScheduleState.SCHEDULED ||
             confirmationAtMs <= 0L || schedule.updatedAtMs != confirmationAtMs ||
             schedule.lastError !in setOf("launch_pending", "delivery_pending") ||
-            now < schedule.firstDueAtMs() || now > schedule.deadlineAtMs() ||
+            now < schedule.firstDueAtMs() || now > schedule.catchUpDeadlineAtMs() ||
             !AccountSessionCoordinator.isScheduleRoutable(schedule)
         ) return@withRegistryLock false
         updateSchedule(id) {
-            it.copy(triggerAtMs = it.firstDueAtMs(), updatedAtMs = now, lastError = null)
+            // 不能把触发时间拨回过去：AlarmManager 会把它压到「现在」，形成确认-重投热循环。
+            it.copy(
+                triggerAtMs = maxOf(it.firstDueAtMs(), now + 1_000L),
+                updatedAtMs = now,
+                lastError = null,
+            )
         }
         true
     }
@@ -518,14 +575,17 @@ object PersistentScheduleRegistry {
                 return@withRegistryLock null
             }
             val nextAttempt = schedule.attemptCount + 1
-            // 持久任务投递失败按 15/30/60 秒递增退避，避免唤醒失败造成循环重投，并受次数和截止时间限制。
+            // 业务子任务按 15/30/60 秒递增退避；全局轮询/唤醒放宽到 5 分钟一档，
+            // 否则两次失败后的第三次就可能耗光次数，把整条轮询链打成终态。
             val delayMs = when (nextAttempt) {
                 1 -> 15_000L
                 2 -> 30_000L
-                else -> 60_000L
+                else -> if (schedule.isGlobalKind()) GLOBAL_DEFER_BACKOFF_MS else 60_000L
             }
+            val attemptLimit =
+                if (schedule.isGlobalKind()) MAX_GLOBAL_DEFERRED_ATTEMPTS else MAX_DEFERRED_ATTEMPTS
             val nextTriggerAt = now + delayMs
-            exhausted = nextAttempt > MAX_DEFERRED_ATTEMPTS || nextTriggerAt > schedule.deadlineAtMs()
+            exhausted = nextAttempt > attemptLimit || nextTriggerAt > schedule.catchUpDeadlineAtMs()
             val updated = if (exhausted) schedule.withFailure("deferred_exhausted:$reason", now)
                 else schedule.withDeferredRetry(nextTriggerAt, reason, now)
             updateSchedule(id) { updated }
@@ -678,12 +738,30 @@ object PersistentScheduleRegistry {
             }
 
             if (!isCurrentSessionSchedule) {
-                StoreAccess.afterTransaction { SystemWakeScheduler.cancelLaunchConfirmationTimeout(schedule.id) }
+                // 恢复广播/开机后会话轮次通常已经换新；全局轮询/唤醒重绑而不是静默丢弃，
+                // 否则整个进程生命周期内都不会再有轮询计划。
+                if (ownerUserId == activeSession.userId &&
+                    schedule.isGlobalKind() &&
+                    schedule.triggerAtMs > now - PersistentScheduleDefaults.GLOBAL_CATCH_UP_WINDOW_MS
+                ) {
+                    Log.record(
+                        TAG,
+                        "持久调度会话已换新，重绑到当前会话[${schedule.name}] ${schedule.sessionEpoch}->${activeSession.sessionEpoch}",
+                    )
+                    retained.add(
+                        schedule.copy(
+                            sessionEpoch = activeSession.sessionEpoch,
+                            updatedAtMs = now,
+                        ),
+                    )
+                } else {
+                    StoreAccess.afterTransaction { SystemWakeScheduler.cancelLaunchConfirmationTimeout(schedule.id) }
+                }
                 continue
             }
 
             if (schedule.triggerAtMs <= now) {
-                if (now <= schedule.deadlineAtMs()) {
+                if (now <= schedule.catchUpDeadlineAtMs()) {
                     if (mode == PersistentReconcileMode.FIRE_ALARM_DUE) {
                         due.add(schedule)
                         retained.add(schedule)
