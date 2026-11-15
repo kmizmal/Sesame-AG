@@ -27,10 +27,10 @@
 
 当前可编译基线：
 
-- CI 环境：`ubuntu-latest`。
+- CI 环境：`ubuntu-24.04`。
 - JDK：Oracle JDK `17.0.1` x64
 - Android SDK：`platform-tools`、`platforms;android-37`、`build-tools;37.0.0`。
-- Gradle： `9.5.1`。
+- Gradle： `9.9.1`。
 - Android Gradle Plugin：`9.2.1`。
 - Kotlin：`2.2.10`。
 - 编译配置：`compileSdk = 37`，`targetSdk = 36`，`minSdk = 29`，Java/Kotlin 目标版本均为 17。
