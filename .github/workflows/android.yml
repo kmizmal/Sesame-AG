@@ -23,6 +23,7 @@ env:
   LOCAL_GRADLE_VERSION: "9.9.1"
   LOCAL_AGP_VERSION: "9.2.1"
   LOCAL_KOTLIN_VERSION: "2.2.10"
+  CI_ABI: "arm64-v8a"
   RELEASE_DIR: app/build/outputs/apk/release
   ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
 
@@ -123,22 +124,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ./gradlew --no-daemon --stacktrace assembleRelease
+          ./gradlew --no-daemon --stacktrace assembleRelease -PciAbi="${CI_ABI}"
 
-      - name: Collect APKs
+      - name: Collect APK
         id: collect
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t apks < <(find "${RELEASE_DIR}" -maxdepth 1 -type f -name "*.apk" | sort)
-          if [[ ${#apks[@]} -eq 0 ]]; then
-            echo "No release APKs found in ${RELEASE_DIR}" >&2
+          expected="${RELEASE_DIR}/app-${CI_ABI}-release.apk"
+          if [[ ! -f "$expected" ]]; then
+            echo "缺少预期产物 $expected，实际目录内容：" >&2
+            ls -lh "${RELEASE_DIR}" >&2 || true
             exit 1
           fi
-          ls -lh "${apks[@]}"
+          # 防止 -PciAbi 失效后又悄悄产出多 ABI 包，掩盖配置回退。
+          others=$(find "${RELEASE_DIR}" -maxdepth 1 -type f -name "*.apk" ! -name "app-${CI_ABI}-release.apk")
+          if [[ -n "$others" ]]; then
+            echo "除 $expected 外还产出了其他 APK，CI 应只构建单一 ABI：" >&2
+            echo "$others" >&2
+            exit 1
+          fi
+          ls -lh "$expected"
           {
-            echo "count=${#apks[@]}"
-            echo "dir=${RELEASE_DIR}"
+            echo "apk=$expected"
+            echo "name=app-${CI_ABI}-release.apk"
           } >> "$GITHUB_OUTPUT"
 
       - name: Package Encrypted APK Artifact
@@ -153,7 +162,7 @@ jobs:
           artifact_path="${RUNNER_TEMP}/Sesame-AG-unsigned-${GITHUB_SHA}.zip"
           (
             cd "${RELEASE_DIR}"
-            zip -r -P "${ARTIFACT_PASSWORD}" "${artifact_path}" *.apk
+            zip -P "${ARTIFACT_PASSWORD}" "${artifact_path}" "${{ steps.collect.outputs.name }}"
           )
           ls -lh "${artifact_path}"
           echo "artifact_path=${artifact_path}" >> "$GITHUB_OUTPUT"
@@ -176,5 +185,7 @@ jobs:
             echo "- 触发: \`${{ github.event_name }}\`"
             echo "- 引用: \`${{ github.ref_name }}\`"
             echo "- 提交: \`${{ github.sha }}\`"
+            echo "- 架构: \`${CI_ABI}\`（仅此单一 ABI）"
+            echo "- 产物: \`${{ steps.collect.outputs.name }}\`"
             echo "- 说明: 内含未签名 APK，请自行使用 apksigner 签名后安装"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -26,8 +26,15 @@ android {
         abi {
             isEnable = true
             reset()
-            include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
-            isUniversalApk = true
+            // CI 只产出 arm64-v8a 单包（-PciAbi=arm64-v8a）；本地构建仍保留全部 ABI 与通用包。
+            val ciAbi = providers.gradleProperty("ciAbi").orNull?.trim().orEmpty()
+            if (ciAbi.isNotEmpty()) {
+                include(ciAbi)
+                isUniversalApk = false
+            } else {
+                include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+                isUniversalApk = true
+            }
         }
     }
     // 使用providers API来支持配置缓存

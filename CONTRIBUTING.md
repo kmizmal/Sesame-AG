@@ -34,6 +34,7 @@
 - Android Gradle Plugin：`9.2.1`。
 - Kotlin：`2.2.10`。
 - 编译配置：`compileSdk = 37`，`targetSdk = 36`，`minSdk = 29`，Java/Kotlin 目标版本均为 17。
+- 产物：CI 通过 `-PciAbi=arm64-v8a` 只构建 `app-arm64-v8a-release.apk`；本地不带该参数时仍按 splits 产出 `armeabi-v7a`/`arm64-v8a`/`x86`/`x86_64` 与通用包。
 
 Windows 本地 debug 构建命令：
 
