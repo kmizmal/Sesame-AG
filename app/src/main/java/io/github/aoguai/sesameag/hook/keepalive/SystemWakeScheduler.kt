@@ -75,6 +75,8 @@ object SystemWakeScheduler {
     fun schedule(context: Context, schedule: PersistentSchedule, silent: Boolean = false): Boolean = try {
         planner.execute {
             val appContext = context.applicationContext ?: context
+            // 重排前先回收长期停在 QUEUED 的全局调度，避免一次唤醒被静默吞掉。
+            PersistentScheduleRegistry.requeueStaleGlobalSchedules()
             val snapshot = PersistentScheduleRegistry.listFresh()
             val scheduled = snapshot.filter { it.state == PersistentScheduleState.SCHEDULED }
             val localScheduled = updateLocalTimer(appContext, scheduled)

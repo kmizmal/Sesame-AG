@@ -21,7 +21,7 @@ env:
   ANDROID_PLATFORM: "android-37.0"
   ANDROID_BUILD_TOOLS: "37.0.0"
   LOCAL_GRADLE_VERSION: "9.9.1"
-  LOCAL_AGP_VERSION: "9.2.1"
+  LOCAL_AGP_VERSION: "9.5.1"
   LOCAL_KOTLIN_VERSION: "2.2.10"
   CI_ABI: "arm64-v8a"
   RELEASE_DIR: app/build/outputs/apk/release
@@ -124,7 +124,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ./gradlew --no-daemon --stacktrace assembleRelease -PciAbi="${CI_ABI}"
+          # 构建输出同时写入文件：失败时把关键行回填到 Summary 与注解，
+          # 否则公开仓库的 Job 日志只能登录后查看，排查成本过高。
+          log="${RUNNER_TEMP}/build.log"
+          set +e
+          ./gradlew --no-daemon --stacktrace assembleRelease -PciAbi="${CI_ABI}" 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ $status -ne 0 ]]; then
+            {
+              echo "## ❌ 构建失败"
+              echo
+              echo '```'
+              grep -nE "^(FAILURE|\* What went wrong|Caused by|e: |error:|Execution failed)|^> " "$log" | head -60 || tail -80 "$log"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            first_error=$(grep -m1 -E "^e: |error:|Caused by: " "$log" || true)
+            if [[ -n "$first_error" ]]; then
+              echo "::error title=Gradle build failed::${first_error//$'\n'/ }"
+            else
+              echo "::error title=Gradle build failed::详见 Job Summary 中的构建输出摘要"
+            fi
+            exit $status
+          fi
 
       - name: Collect APK
         id: collect

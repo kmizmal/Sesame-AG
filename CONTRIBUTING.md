@@ -31,7 +31,7 @@
 - JDK：Oracle JDK `17.0.1` x64
 - Android SDK：`platform-tools`、`platforms;android-37`、`build-tools;37.0.0`。
 - Gradle： `9.9.1`。
-- Android Gradle Plugin：`9.2.1`。
+- Android Gradle Plugin：`9.5.1`。
 - Kotlin：`2.2.10`。
 - 编译配置：`compileSdk = 37`，`targetSdk = 36`，`minSdk = 29`，Java/Kotlin 目标版本均为 17。
 - 产物：CI 通过 `-PciAbi=arm64-v8a` 只构建 `app-arm64-v8a-release.apk`；本地不带该参数时仍按 splits 产出 `armeabi-v7a`/`arm64-v8a`/`x86`/`x86_64` 与通用包。

@@ -34,6 +34,16 @@ object PersistentScheduleRegistry {
 
     /** 宿主进程重启后重新排期的延迟，避免与启动期初始化抢资源。 */
     private const val RECOVERY_RETRY_DELAY_MS = 30 * 1000L
+
+    /**
+     * 全局轮询/唤醒停在 QUEUED 超过该时长，说明「已认领但没有派发」：
+     * 主任务长时间不结束、或派发入口提前返回时，记录既不会被路由（只处理 SCHEDULED），
+     * 也不会有任何闹钟（排闹钟同样只取 SCHEDULED），于是一次唤醒就被静默吞掉。
+     */
+    private const val STALE_GLOBAL_QUEUE_MS = 30 * 60 * 1000L
+
+    /** 重排扫描本身有磁盘开销，限制最小间隔。 */
+    private const val STALE_QUEUE_SWEEP_INTERVAL_MS = 5 * 60 * 1000L
     private val activeModuleChildStates = setOf(
         PersistentScheduleState.QUEUED,
         PersistentScheduleState.RUNNING,
@@ -54,6 +64,9 @@ object PersistentScheduleRegistry {
     private var cache: List<PersistentSchedule>? = null
     private val registryLockDepth = ThreadLocal<Int>()
     private var recoveredExecutionsInProcess = false
+
+    @Volatile
+    private var lastStaleQueueSweepAtMs = 0L
 
     data class ReconcileResult(
         val dueSchedules: List<PersistentSchedule>,
@@ -265,6 +278,47 @@ object PersistentScheduleRegistry {
     fun list(): List<PersistentSchedule> {
         if (!ensureStorage()) return emptyList()
         return loadMutable().toList()
+    }
+
+    /**
+     * 把长期停在 QUEUED 的全局轮询/唤醒重新排入 SCHEDULED。
+     *
+     * 只处理 GLOBAL_* 的 QUEUED：RUNNING 表示主任务确实在执行，MODULE_CHILD 由业务自行续接。
+     */
+    fun requeueStaleGlobalSchedules(now: Long = System.currentTimeMillis()): Int {
+        if (now - lastStaleQueueSweepAtMs < STALE_QUEUE_SWEEP_INTERVAL_MS) return 0
+        lastStaleQueueSweepAtMs = now
+        return try {
+            withRegistryLock {
+                if (!ensureStorage()) return@withRegistryLock 0
+                val schedules = loadMutable()
+                var requeued = 0
+                for (index in schedules.indices) {
+                    val schedule = schedules[index]
+                    if (!schedule.isGlobalKind() || schedule.state != PersistentScheduleState.QUEUED) continue
+                    if (now - schedule.updatedAtMs <= STALE_GLOBAL_QUEUE_MS) continue
+                    Log.record(
+                        TAG,
+                        "全局调度长期停在排队状态，重新排队[${schedule.name}] id=${schedule.id} " +
+                            "停留=${(now - schedule.updatedAtMs) / 1000}s",
+                    )
+                    schedules[index] = schedule.copy(
+                        state = PersistentScheduleState.SCHEDULED,
+                        triggerAtMs = now + RECOVERY_RETRY_DELAY_MS,
+                        updatedAtMs = now,
+                        lastError = "stale_queue_requeued",
+                    )
+                    requeued++
+                }
+                if (requeued > 0) save(schedules)
+                requeued
+            }
+        } catch (e: InterruptedException) {
+            throw e
+        } catch (e: Exception) {
+            Log.printStackTrace(TAG, "全局调度排队超时回收失败", e)
+            0
+        }
     }
 
     /**
