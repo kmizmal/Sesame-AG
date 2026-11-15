@@ -16,10 +16,10 @@ permissions:
 
 jobs:
   triage-issue:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Classify issue and validate required information
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const eventIssue = context.payload.issue;
