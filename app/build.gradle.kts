@@ -22,19 +22,17 @@ android {
             useLegacyPackaging = true
         }
     }
+    // CI 只产出单一 ABI（-PciAbi=arm64-v8a）；不带该参数时保持全部 ABI 加通用包。
+    val ciAbi = providers.gradleProperty("ciAbi").orNull?.trim().orEmpty()
+    val allAbis = listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+    val buildAbis = if (ciAbi.isNotEmpty()) listOf(ciAbi) else allAbis
+
     splits {
         abi {
             isEnable = true
             reset()
-            // CI 只产出 arm64-v8a 单包（-PciAbi=arm64-v8a）；本地构建仍保留全部 ABI 与通用包。
-            val ciAbi = providers.gradleProperty("ciAbi").orNull?.trim().orEmpty()
-            if (ciAbi.isNotEmpty()) {
-                include(ciAbi)
-                isUniversalApk = false
-            } else {
-                include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
-                isUniversalApk = true
-            }
+            include(*buildAbis.toTypedArray())
+            isUniversalApk = ciAbi.isEmpty()
         }
     }
     // 使用providers API来支持配置缓存
@@ -81,8 +79,10 @@ android {
         buildConfigField("String", "BUILD_TIME", "\"$buildTime\"")
         buildConfigField("String", "OFFICIAL_SIGNING_CERT_SHA256", "\"$officialSigningCertSha256\"")
         if (isCIBuild) {
+            // ndk.abiFilters 与 splits 的 abi 过滤必须一致，否则 AGP 会报
+            // Conflicting configuration（两者都设置且不相等时直接失败）。
             ndk {
-                abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))
+                abiFilters.addAll(buildAbis)
             }
         }
     }
