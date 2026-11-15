@@ -78,11 +78,11 @@ android {
         buildConfigField("String", "BUILD_DATE", "\"$buildDate\"")
         buildConfigField("String", "BUILD_TIME", "\"$buildTime\"")
         buildConfigField("String", "OFFICIAL_SIGNING_CERT_SHA256", "\"$officialSigningCertSha256\"")
-        if (isCIBuild) {
-            // ndk.abiFilters 与 splits 的 abi 过滤必须一致，否则 AGP 会报
-            // Conflicting configuration（两者都设置且不相等时直接失败）。
+        // AGP 不允许 ndk.abiFilters 与 splits 的 abi 过滤同时存在；
+        // 指定 -PciAbi 时完全交给 splits 决定 ABI，此处不再写 abiFilters。
+        if (isCIBuild && ciAbi.isEmpty()) {
             ndk {
-                abiFilters.addAll(buildAbis)
+                abiFilters.addAll(allAbis)
             }
         }
     }
