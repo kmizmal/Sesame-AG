@@ -131,6 +131,10 @@ class CoroutineTaskRunner(allModels: List<Model>) {
             longRunningTaskLimiter = Semaphore(1)
             Log.record(TAG, "🚀 开始执行任务流程 (并发数: $maxConcurrency)")
 
+            // 先登记下一轮再干活：进程若在任务中途被冻结或回收，finally 不会执行，
+            // 只靠 finally 续期会让整条轮询链彻底消失（现象就是「定时任务休眠」）。
+            registerNextScheduleBeforeRun()
+
             CustomSettings.loadForTaskRunner()
             val status = CustomSettings.getOnceDailyStatus(enableLog = true)
 
@@ -687,6 +691,18 @@ class CoroutineTaskRunner(allModels: List<Model>) {
             }
         } catch (e: Exception) {
             Log.printStackTrace(TAG, "调度失败", e)
+        }
+    }
+
+    /** 执行前预登记下一轮；结束时 [scheduleNext] 会按实际完成时间覆盖成更晚的计划。 */
+    private fun registerNextScheduleBeforeRun() {
+        try {
+            ApplicationHook.scheduleNextExecutionInternal(System.currentTimeMillis())
+            if (ApplicationHook.nextExecutionTime > 0L) {
+                Log.record(TAG, "🗓 预登记下次轮询计划: ${TimeUtil.getCommonDate(ApplicationHook.nextExecutionTime)}")
+            }
+        } catch (e: Exception) {
+            Log.printStackTrace(TAG, "预登记下次调度失败", e)
         }
     }
 

@@ -67,9 +67,19 @@ object ScheduledTaskRouter {
             val deliverable = runInterruptible {
                 due.filter { schedule ->
                     when {
-                        now > schedule.deadlineAtMs() -> {
+                        now > schedule.catchUpDeadlineAtMs() -> {
                             PersistentScheduleRegistry.markExpired(context, schedule.id, now, source)
                             false
+                        }
+                        now > schedule.deadlineAtMs() -> {
+                            // 全局轮询/唤醒的迟到来自降级投递或 Doze，不是业务过期；
+                            // 判成 EXPIRED 会让整条调度链再没有任何闹钟。
+                            Log.record(
+                                TAG,
+                                "持久调度[${schedule.name}]迟到${(now - schedule.deadlineAtMs()) / 1000}s，" +
+                                    "按补执行宽限继续投递 source=$source",
+                            )
+                            true
                         }
                         schedule.lastError in setOf("launch_pending", "delivery_pending") -> {
                             if (schedule.lastError == "launch_pending") {
@@ -173,7 +183,7 @@ object ScheduledTaskRouter {
                 return true
             }
             val targetProcess = isTargetProcess(appContext)
-            if (now > schedule.deadlineAtMs()) {
+            if (now > schedule.catchUpDeadlineAtMs()) {
                 if (targetProcess && schedule.kind == PersistentScheduleKind.MODULE_CHILD) {
                     val payload = payloadOf(schedule)
                     if (payload.optString("child_kind") == EnergyWaitingManager.PERSISTENT_CHILD_KIND) {
@@ -185,6 +195,13 @@ object ScheduledTaskRouter {
                 PersistentScheduleRegistry.markExpired(appContext, schedule.id, now, source)
                 Log.record(TAG, "持久任务[${schedule.name}]超过触发窗口，已过期 source=$source")
                 return true
+            }
+            if (now > schedule.deadlineAtMs()) {
+                Log.record(
+                    TAG,
+                    "持久调度[${schedule.name}]迟到${(now - schedule.deadlineAtMs()) / 1000}s，" +
+                        "按补执行宽限继续投递 source=$source",
+                )
             }
             if (schedule.lastError in setOf("launch_pending", "delivery_pending")) {
                 PersistentScheduleRegistry.rescheduleDeferred(

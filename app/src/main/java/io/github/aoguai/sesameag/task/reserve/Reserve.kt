@@ -64,8 +64,10 @@ class Reserve : ModelTask() {
         return modelFields
     }
 
-    override fun check(): Boolean =
-        when {
+    override fun check(): Boolean {
+        // 覆写 check() 会绕过基类的 TaskCommon.update()，这里显式刷新避免使用旧休眠快照。
+        TaskCommon.update()
+        return when {
             TaskCommon.IS_ENERGY_TIME -> {
                 Log.forest("⏸ 当前为只收能量时间【${BaseModel.energyTime.value}】，停止执行${getName()}任务！")
                 false
@@ -80,6 +82,7 @@ class Reserve : ModelTask() {
                 true
             }
         }
+    }
 
     override fun runJava() {
         GlobalThreadPools.execute {

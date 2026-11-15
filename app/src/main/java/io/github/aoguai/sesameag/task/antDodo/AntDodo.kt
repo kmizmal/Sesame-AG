@@ -149,6 +149,9 @@ class AntDodo : ModelTask() {
     }
 
     override fun check(): Boolean {
+        // 覆写 check() 会绕过基类的 TaskCommon.update()；排队等并发槽期间可能已经跨过休眠窗口，
+        // 这里显式刷新，避免整批任务用排队前的旧快照继续报「模块休眠时间」。
+        TaskCommon.update()
         return when {
             TaskCommon.IS_ENERGY_TIME -> {
                 Log.dodo("⏸ 当前为只收能量时间【${BaseModel.energyTime.value}】，停止执行${getName()}任务！")
