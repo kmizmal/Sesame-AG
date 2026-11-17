@@ -617,6 +617,13 @@ class ApplicationHook {
         )
 
         const val TAG: String = "ApplicationHook" // 简化TAG
+
+        /** 降级计时器名与持久调度名分开，避免持久路径的幂等取消把兜底计时顺带撤掉。 */
+        private const val MIDNIGHT_FALLBACK_TASK = "每日0点任务(降级计时)"
+        private const val CUSTOM_WAKE_FALLBACK_TASK = "自定义唤醒任务(降级计时)"
+
+        /** 降级计时到点后，与最新唤醒点相差该范围内才触发，否则按最新配置重排。 */
+        private const val FALLBACK_TRIGGER_TOLERANCE_MS = 5 * 60 * 1000L
         var finalProcessName: String? = ""
 
         // 广播接收器实例，用于注销
@@ -1107,6 +1114,48 @@ class ApplicationHook {
                 if (m.name == "makeApplicationInner") {
                     frameworkInterface?.deoptimize(m)
                 }
+            }
+        }
+
+        /**
+         * 直接重建轮询计划，不检查活跃时间、不做「长时间未执行就重新拉起」的副作用。
+         *
+         * 看门狗在链路断掉时用它补登记；若走 [scheduleNextExecutionInternal]，补登记本身就可能先把
+         * 目标应用重新拉起，与用户「不主动打扰」的预期冲突。
+         */
+        fun reRegisterPollSchedule() {
+            try {
+                val intervalMs = (checkInterval.value ?: 0).toLong()
+                    .coerceAtLeast(PersistentScheduleDefaults.DEFAULT_TOLERANCE_MS)
+                val triggerAt = System.currentTimeMillis() + intervalMs
+                val context = appContext
+                if (context == null) {
+                    Log.record(TAG, "补登记轮询计划失败：缺少应用 Context")
+                    return
+                }
+                val activeSession = AccountSessionCoordinator.currentSession()
+                val schedule =
+                    UnifiedScheduler.schedulePersistentTrigger(
+                        context = context,
+                        name = "轮询任务",
+                        kind = PersistentScheduleKind.GLOBAL_POLL,
+                        triggerAtMs = triggerAt,
+                        dedupeKey = "alarm_poll",
+                        precisionPolicy = PersistentSchedulePrecisionPolicy.FLEXIBLE_POLL,
+                        payloadJson = "{}",
+                        toleranceMs = intervalMs,
+                        ownerUserId = activeSession?.userId ?: currentUid,
+                        sessionEpoch = activeSession?.sessionEpoch ?: AccountSessionCoordinator.currentSessionEpoch(),
+                    )
+                if (schedule.state == PersistentScheduleState.SCHEDULED) {
+                    nextExecutionTime = schedule.triggerAtMs
+                    mainTaskNextScheduleUpdatedAtMs = System.currentTimeMillis()
+                    Log.record(TAG, "看门狗补登记轮询计划成功: ${TimeUtil.getCommonDate(schedule.triggerAtMs)}")
+                } else {
+                    Log.record(TAG, "看门狗补登记轮询计划失败: ${schedule.lastError}")
+                }
+            } catch (e: Exception) {
+                Log.printStackTrace(TAG, "看门狗补登记轮询计划异常", e)
             }
         }
 
@@ -1832,14 +1881,10 @@ class ApplicationHook {
                     if (PersistentLaunchPolicy.isFrontLaunchDisabled(midnightSchedule.lastError)) {
                         record(TAG, "已禁止系统调度前台拉起目标应用，每日0点任务降级为仅进程存活时等待")
                     }
-                    // 持久调度不可用时仍须等到下一个零点，再执行跨日刷新，不能提前触发。
-                    UnifiedScheduler.scheduleLongDelay(delayToMidnight, "每日0点任务") {
-                        record(TAG, "⏰ 0点任务触发")
-                        updateDay()
-                        ApplicationHookEntry.onWakeupMidnight()
-                        setWakenAtTimeAlarm()
-                    }
+                    // 降级计时同样每次重排重新对齐；名字与持久路径区分开，避免被幂等取消顺带撤掉。
+                    scheduleMidnightFallback(delayToMidnight, "系统闹钟不可用")
                 } else {
+                    UnifiedScheduler.cancelNamedTask(MIDNIGHT_FALLBACK_TASK)
                     UnifiedScheduler.cancelNamedTask("每日0点任务")
                 }
             }
@@ -1877,13 +1922,12 @@ class ApplicationHook {
                 if (PersistentLaunchPolicy.isFrontLaunchDisabled(customWakeSchedule.lastError)) {
                     record(TAG, "已禁止系统调度前台拉起目标应用，自定义唤醒任务降级为仅进程存活时等待[$timeToken]")
                 }
-                // 进程内降级计时仍对齐用户配置的下次唤醒时间，不额外增加业务等待。
-                UnifiedScheduler.scheduleLongDelay(delay, "自定义唤醒任务") {
-                    record(TAG, "? 自定义触发: $timeToken")
-                    ApplicationHookEntry.onWakeupCustom(timeToken)
-                    setWakenAtTimeAlarm()
-                }
+                // 持久调度不可用时：进程内计时补一次，任何一次重排都重新对齐；
+                // 否则唤醒链一旦断掉（进程被回收、计时器被取消）就再也无人接手。
+                // 两个定时器名称区分来源，避免持久路径的幂等取消把降级计时器一起撤掉。
+                scheduleCustomWakeFallback(delay, timeToken, "系统闹钟不可用")
             } else {
+                UnifiedScheduler.cancelNamedTask(CUSTOM_WAKE_FALLBACK_TASK)
                 UnifiedScheduler.cancelPersistentByNameExceptDedupeKey(
                     context,
                     "自定义唤醒任务",
@@ -1892,6 +1936,46 @@ class ApplicationHook {
                 )
             }
             return
+        }
+
+        /** 每日0点的降级计时：持久调度登记失败时兜底，每次重排按最新零点重新对齐。 */
+        private fun scheduleMidnightFallback(
+            delayToMidnight: Long,
+            reason: String,
+        ) {
+            if (delayToMidnight <= 0L) return
+            UnifiedScheduler.cancelNamedTask(MIDNIGHT_FALLBACK_TASK)
+            UnifiedScheduler.scheduleLongDelay(delayToMidnight, MIDNIGHT_FALLBACK_TASK) {
+                record(TAG, "⏰ 0点任务降级触发 reason=$reason")
+                updateDay()
+                ApplicationHookEntry.onWakeupMidnight()
+                setWakenAtTimeAlarm()
+            }
+            record(TAG, "每日0点任务已挂降级进程内计时 reason=$reason")
+        }
+
+        /** 自定义唤醒的降级计时：持久调度登记失败时兜底，每次重排都按最新时间重新对齐。 */
+        private fun scheduleCustomWakeFallback(
+            delay: Long,
+            timeToken: String,
+            reason: String,
+        ) {
+            if (delay <= 0L) return
+            UnifiedScheduler.cancelNamedTask(CUSTOM_WAKE_FALLBACK_TASK)
+            UnifiedScheduler.scheduleLongDelay(delay, CUSTOM_WAKE_FALLBACK_TASK) {
+                // 到点时先按最新配置重新计算：配置或日期变化后不能按旧时刻硬触发。
+                val latest = wakenAtTimeList.nextPointAt()
+                val now = System.currentTimeMillis()
+                if (latest == null || latest > now + FALLBACK_TRIGGER_TOLERANCE_MS) {
+                    record(TAG, "降级唤醒计时到点但已非最近唤醒点[$timeToken]，改按最新配置重排")
+                    setWakenAtTimeAlarm()
+                    return@scheduleLongDelay
+                }
+                record(TAG, "⏰ 自定义唤醒降级触发[$timeToken] reason=$reason")
+                ApplicationHookEntry.onWakeupCustom(timeToken)
+                setWakenAtTimeAlarm()
+            }
+            record(TAG, "自定义唤醒已挂降级进程内计时[$timeToken] reason=$reason")
         }
 
         fun registerBroadcastReceiver(context: Context) {

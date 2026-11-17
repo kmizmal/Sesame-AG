@@ -42,6 +42,14 @@ object PersistentScheduleRegistry {
      */
     private const val STALE_GLOBAL_QUEUE_MS = 30 * 60 * 1000L
 
+    /**
+     * 全局轮询/唤醒停在 RUNNING 超过该时长，说明「已认领但主任务没走完」：
+     * 主任务被静默取消、或在派发前就断链时，记录既不会被路由，也不会有闹钟，
+     * 并且还会一直挡着 canScheduleDispatch（RUNNING 在 activeModuleChildStates 里），
+     * 于是后续所有触发都被排队吞掉。业务子任务仍按各自超时处理，不受影响。
+     */
+    private const val STALE_GLOBAL_RUNNING_MS = 60 * 60 * 1000L
+
     /** 重排扫描本身有磁盘开销，限制最小间隔。 */
     private const val STALE_QUEUE_SWEEP_INTERVAL_MS = 5 * 60 * 1000L
     private val activeModuleChildStates = setOf(
@@ -116,8 +124,17 @@ object PersistentScheduleRegistry {
                 Log.record(TAG, "持久调度已因禁止系统调度前台拉起目标应用而未注册[${effective.name}]")
                 return@withRegistryLock effective.withFailure(prepared.blockedReason, now)
             }
-            replaced.firstOrNull { isSameScheduledTask(it, effective) }?.let {
-                return@withRegistryLock it
+            // 同一份计划重排（例如每次唤醒都重算 0 点/下次唤醒）时物理闹钟注册仍可能失败；
+            // 那种情况下这里必须真的重写一次记录并重排闹钟，不能因为「内容没变」就直接返回旧记录——
+            // 旧记录的状态可能与新计划不一致，返回它之后调用方会把新计划当成已注册而不再重试。
+            replaced.firstOrNull { isSameScheduledTask(it, effective) }?.let { existing ->
+                if (existing.state == PersistentScheduleState.SCHEDULED &&
+                    existing.lastError == null &&
+                    !SystemWakeScheduler.schedule(context, existing, silent = true)
+                ) {
+                    Log.record(TAG, "持久调度重排物理闹钟失败[${existing.name}]，保留记录待下次重排")
+                }
+                return@withRegistryLock existing
             }
             removed = replaced
             schedules.removeAll(removed.toSet())
@@ -295,18 +312,33 @@ object PersistentScheduleRegistry {
                 var requeued = 0
                 for (index in schedules.indices) {
                     val schedule = schedules[index]
-                    if (!schedule.isGlobalKind() || schedule.state != PersistentScheduleState.QUEUED) continue
-                    if (now - schedule.updatedAtMs <= STALE_GLOBAL_QUEUE_MS) continue
+                    if (!schedule.isGlobalKind() || schedule.state !in setOf(
+                            PersistentScheduleState.QUEUED,
+                            PersistentScheduleState.RUNNING,
+                        )
+                    ) {
+                        continue
+                    }
+                    val staleAfterMs = if (schedule.state == PersistentScheduleState.QUEUED) {
+                        STALE_GLOBAL_QUEUE_MS
+                    } else {
+                        STALE_GLOBAL_RUNNING_MS
+                    }
+                    if (now - schedule.updatedAtMs <= staleAfterMs) continue
                     Log.record(
                         TAG,
-                        "全局调度长期停在排队状态，重新排队[${schedule.name}] id=${schedule.id} " +
+                        "全局调度长期停在${schedule.state}，重新排队[${schedule.name}] id=${schedule.id} " +
                             "停留=${(now - schedule.updatedAtMs) / 1000}s",
                     )
                     schedules[index] = schedule.copy(
                         state = PersistentScheduleState.SCHEDULED,
                         triggerAtMs = now + RECOVERY_RETRY_DELAY_MS,
                         updatedAtMs = now,
-                        lastError = "stale_queue_requeued",
+                        lastError = if (schedule.state == PersistentScheduleState.QUEUED) {
+                            "stale_queue_requeued"
+                        } else {
+                            "stale_running_requeued"
+                        },
                     )
                     requeued++
                 }
@@ -340,6 +372,25 @@ object PersistentScheduleRegistry {
                 // 卡死的 QUEUED 记录不能让主流程派发永久停摆；RUNNING 仍按业务耗时判定。
                 !(schedule.state == PersistentScheduleState.QUEUED &&
                     now - schedule.updatedAtMs > STALE_QUEUED_CHILD_MS)
+        }
+    }
+
+    /**
+     * 只判断当前会话是否还有一条可执行的全局轮询/唤醒。
+     *
+     * 全局记录的收敛点全在这里，看门狗据此决定是否需要补登记下一轮。
+     */
+    fun hasRunnableGlobalSchedule(
+        ownerUserId: String?,
+        sessionEpoch: Long,
+    ): Boolean {
+        val safeOwnerUserId = ownerUserId?.trim().orEmpty()
+        if (safeOwnerUserId.isEmpty() || sessionEpoch <= 0L || !ensureStorage()) return false
+        return loadMutable().any { schedule ->
+            schedule.isGlobalKind() &&
+                schedule.state == PersistentScheduleState.SCHEDULED &&
+                schedule.ownerUserId?.trim() == safeOwnerUserId &&
+                schedule.sessionEpoch == sessionEpoch
         }
     }
 

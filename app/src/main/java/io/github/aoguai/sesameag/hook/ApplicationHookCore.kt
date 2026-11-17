@@ -2,7 +2,9 @@ package io.github.aoguai.sesameag.hook
 
 import io.github.aoguai.sesameag.hook.ApplicationHookConstants.TriggerInfo
 import io.github.aoguai.sesameag.hook.ApplicationHookConstants.TriggerType
+import io.github.aoguai.sesameag.hook.keepalive.GlobalChainWatchdog
 import io.github.aoguai.sesameag.hook.keepalive.PersistentScheduleRegistry
+import io.github.aoguai.sesameag.util.Log.printStackTrace
 import io.github.aoguai.sesameag.util.Log.record
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -138,6 +140,12 @@ object ApplicationHookCore {
         record(TAG, "▶️ dispatch mainTask, pending=${ApplicationHookConstants.pendingTriggerCount()}")
         val job = mainTask.startTask(force = false, rounds = 1)
         job.invokeOnCompletion {
+            // 主任务结束时收敛残局：这条链断了就补登记，否则一次取消就能让轮询永久停摆。
+            GlobalChainWatchdog.ensureAlive(
+                context = ApplicationHook.appContext,
+                ownerUserId = currentOwnerUserId,
+                sessionEpoch = currentSessionEpoch,
+            ) { ctx -> ApplicationHook.reRegisterPollSchedule() }
             dispatchIfNeeded()
         }
     }
