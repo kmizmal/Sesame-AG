@@ -15,6 +15,12 @@ object ApplicationHookCore {
     private val dispatchScheduled = AtomicBoolean(false)
     private val dispatchRequested = AtomicBoolean(false)
 
+    /** 全局触发排空：全局轮询/唤醒不会被主任务消费，必须单独清账，否则会永久占住触发队列。 */
+    private val drainInFlight = AtomicBoolean(false)
+    @Volatile
+    private var drainScheduledAtMs = 0L
+    private const val DRAIN_RETRY_GAP_MS = 15 * 1000L
+
     fun requestExecution(trigger: TriggerInfo): Boolean {
         val boundTrigger = AccountSessionCoordinator.bindTrigger(trigger)
         if (!AccountSessionCoordinator.shouldAcceptTrigger(boundTrigger)) {
@@ -62,6 +68,7 @@ object ApplicationHookCore {
     fun dispatchIfNeeded() {
         dispatchRequested.set(true)
         scheduleDispatchIfPossible()
+        scheduleGlobalTriggerDrain()
     }
 
     private fun scheduleDispatchIfPossible() {
@@ -79,6 +86,51 @@ object ApplicationHookCore {
                 }
             }
         }
+    }
+
+    /**
+     * 排空无法由主任务执行的全局触发。
+     *
+     * 全局轮询/唤醒的作用只是「到点了」：真正要跑的下一轮轮询由 [GlobalChainWatchdog] 与
+     * TaskRunner 结束时的预登记负责，它们本身没有主任务可以消费。只要它们一直躺在队列里，
+     * [canScheduleDispatch] 就永远为真、[dispatchPendingTriggers] 就会一直走到
+     * 「主任务在跑/队列非空」的提前返回，而队列里的东西又永远没人拿走——
+     * 实证里表现为 09:30 的 ALARM_POLL 一直挂到 10:51 才被超时回收，期间一次主任务都没派发。
+     */
+    private fun scheduleGlobalTriggerDrain() {
+        val now = System.currentTimeMillis()
+        if (now - drainScheduledAtMs < DRAIN_RETRY_GAP_MS) return
+        if (ApplicationHook.mainTask?.isRunning == true) return
+        if (!drainInFlight.compareAndSet(false, true)) return
+        drainScheduledAtMs = now
+        ApplicationHookConstants.submitEntry("drain_global_triggers") {
+            try {
+                drainGlobalTriggers()
+            } finally {
+                drainInFlight.set(false)
+            }
+        }
+    }
+
+    private fun drainGlobalTriggers() {
+        val drained = ApplicationHookConstants.removePendingTriggers("global_trigger_not_consumable") { trigger ->
+            // 只清「纯信号」：带 wakenAtTime 的唤醒要参与跨日刷新与唤醒链，仍交给正常派发路径。
+            trigger.type == TriggerType.ALARM_POLL ||
+                (trigger.type == TriggerType.ALARM_WAKEUP && !trigger.wakenAtTime)
+        }
+        if (drained.isEmpty()) return
+        drained.forEach { trigger ->
+            val scheduleId = trigger.persistentScheduleId?.takeIf { it.isNotBlank() } ?: return@forEach
+            // 只标完成会留下空窗：这两类记录不会被执行，必须顺手补登记下一轮。
+            PersistentScheduleRegistry.onGlobalTriggerDrained(
+                context = ApplicationHook.appContext,
+                scheduleId = scheduleId,
+                registerNextPoll = { ctx -> ApplicationHook.reRegisterPollSchedule() },
+            )
+        }
+        record(TAG, "🧹 已排空不可执行的全局触发 ${drained.size} 个，pending=${ApplicationHookConstants.pendingTriggerCount()}")
+        // 排空后真正该跑的任务才有机会派发。
+        dispatchIfNeeded()
     }
 
     private fun canScheduleDispatch(): Boolean {

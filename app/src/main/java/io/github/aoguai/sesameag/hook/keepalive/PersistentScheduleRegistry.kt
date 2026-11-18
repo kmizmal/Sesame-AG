@@ -4,6 +4,7 @@ import android.content.Context
 import com.fasterxml.jackson.core.type.TypeReference
 import io.github.aoguai.sesameag.hook.AccountSessionCoordinator
 import io.github.aoguai.sesameag.hook.AccountSlotRegistry
+import io.github.aoguai.sesameag.hook.ApplicationHook
 import io.github.aoguai.sesameag.hook.ApplicationHookCore
 import io.github.aoguai.sesameag.util.DataStore
 import io.github.aoguai.sesameag.util.Files
@@ -373,6 +374,36 @@ object PersistentScheduleRegistry {
                 !(schedule.state == PersistentScheduleState.QUEUED &&
                     now - schedule.updatedAtMs > STALE_QUEUED_CHILD_MS)
         }
+    }
+
+    /**
+     * 全局轮询/唤醒的触发被排空后补做它们本该完成的事。
+     *
+     * 这两类记录只是「到点了」的信号：真正的下一轮要么由下一轮轮询、要么由主任务结束时的预登记负责，
+     * 它们不会被主任务消费。因此排空触发时不能只 [markFired]，否则会留下
+     * 「本次没跑 + 下一轮没登记」的空窗，必须在这里补登记一份新的轮询计划。
+     */
+    fun onGlobalTriggerDrained(
+        context: Context?,
+        scheduleId: String,
+        registerNextPoll: (Context) -> Unit,
+    ): Boolean {
+        val schedule = get(scheduleId) ?: return false
+        if (!schedule.isGlobalKind()) return false
+        if (schedule.state != PersistentScheduleState.QUEUED &&
+            schedule.state != PersistentScheduleState.SCHEDULED
+        ) {
+            return false
+        }
+        markFired(context, scheduleId, source = "global_trigger_drained")
+        val ctx = context ?: return true
+        if (schedule.kind == PersistentScheduleKind.GLOBAL_WAKEUP) {
+            // 唤醒到点：重算零点与下一次自定义唤醒，否则唤醒链会停在这一次。
+            ApplicationHook.setWakenAtTimeAlarm()
+        }
+        registerNextPoll(ctx)
+        Log.record(TAG, "全局触发已排空并按计划补登记下一轮[${schedule.name}] id=$scheduleId")
+        return true
     }
 
     /**
