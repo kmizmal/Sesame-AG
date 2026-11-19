@@ -103,7 +103,8 @@ data class PersistentSchedule(
 
     /** 认领后多久没动静算卡死；全局轮询/唤醒与业务子任务的阈值不同。 */
     fun staleClaimAfterMs(): Long =
-        if (isGlobalKind()) GLOBAL_STALE_CLAIM_MS else CHILD_STALE_CLAIM_MS
+        if (isGlobalKind()) PersistentScheduleDefaults.GLOBAL_STALE_CLAIM_MS
+        else PersistentScheduleDefaults.CHILD_STALE_CLAIM_MS
 
     /**
      * 全局轮询/唤醒的迟到窗口。
