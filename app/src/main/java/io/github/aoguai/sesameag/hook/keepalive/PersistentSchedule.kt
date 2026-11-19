@@ -97,6 +97,14 @@ data class PersistentSchedule(
 
     fun isGlobalKind(): Boolean = kind in GLOBAL_SCHEDULE_KINDS
 
+    /** 已被认领但还没执行（QUEUED/RUNNING）：这类记录上没有闹钟，超时就会永久卡住。 */
+    fun isClaimed(): Boolean =
+        state == PersistentScheduleState.QUEUED || state == PersistentScheduleState.RUNNING
+
+    /** 认领后多久没动静算卡死；全局轮询/唤醒与业务子任务的阈值不同。 */
+    fun staleClaimAfterMs(): Long =
+        if (isGlobalKind()) GLOBAL_STALE_CLAIM_MS else CHILD_STALE_CLAIM_MS
+
     /**
      * 全局轮询/唤醒的迟到窗口。
      *
@@ -172,6 +180,12 @@ data class PersistentSchedule(
 
 object PersistentScheduleDefaults {
     const val DEFAULT_TOLERANCE_MS: Long = 10 * 60 * 1000L
+
+    /** 全局轮询/唤醒停在 QUEUED/RUNNING 的上限，超过就说明「认领了但永远轮不到执行」。 */
+    const val GLOBAL_STALE_CLAIM_MS: Long = 30 * 60 * 1000L
+
+    /** 业务子任务停在 QUEUED/RUNNING 的上限，超过就按失败收敛，避免一直挡着主流程派发。 */
+    const val CHILD_STALE_CLAIM_MS: Long = 30 * 60 * 1000L
 
     /** 全局轮询/唤醒在 deadline 之后的补执行宽限窗，需覆盖一次 Doze 维护窗口与降级投递延迟。 */
     const val GLOBAL_CATCH_UP_WINDOW_MS: Long = 6 * 60 * 60 * 1000L

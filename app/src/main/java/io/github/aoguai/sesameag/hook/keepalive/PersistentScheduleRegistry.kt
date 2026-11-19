@@ -30,8 +30,7 @@ object PersistentScheduleRegistry {
     /** 全局轮询/唤醒在多次投递失败后的退避间隔，避免在 Doze 里高频空转。 */
     private const val GLOBAL_DEFER_BACKOFF_MS = 5 * 60 * 1000L
 
-    /** QUEUED 表示「已被认领、即将执行」；长时间停留说明入口提前返回，不能一直封死主流程派发。 */
-    private const val STALE_QUEUED_CHILD_MS = 5 * 60 * 1000L
+
 
     /** 宿主进程重启后重新排期的延迟，避免与启动期初始化抢资源。 */
     private const val RECOVERY_RETRY_DELAY_MS = 30 * 1000L
@@ -41,7 +40,7 @@ object PersistentScheduleRegistry {
      * 主任务长时间不结束、或派发入口提前返回时，记录既不会被路由（只处理 SCHEDULED），
      * 也不会有任何闹钟（排闹钟同样只取 SCHEDULED），于是一次唤醒就被静默吞掉。
      */
-    private const val STALE_GLOBAL_QUEUE_MS = 30 * 60 * 1000L
+    private const val STALE_GLOBAL_QUEUE_MS = PersistentScheduleDefaults.GLOBAL_STALE_CLAIM_MS
 
     /**
      * 全局轮询/唤醒停在 RUNNING 超过该时长，说明「已认领但主任务没走完」：
@@ -49,7 +48,7 @@ object PersistentScheduleRegistry {
      * 并且还会一直挡着 canScheduleDispatch（RUNNING 在 activeModuleChildStates 里），
      * 于是后续所有触发都被排队吞掉。业务子任务仍按各自超时处理，不受影响。
      */
-    private const val STALE_GLOBAL_RUNNING_MS = 60 * 60 * 1000L
+    private const val STALE_GLOBAL_RUNNING_MS = 2 * PersistentScheduleDefaults.GLOBAL_STALE_CLAIM_MS
 
     /** 重排扫描本身有磁盘开销，限制最小间隔。 */
     private const val STALE_QUEUE_SWEEP_INTERVAL_MS = 5 * 60 * 1000L
@@ -299,59 +298,15 @@ object PersistentScheduleRegistry {
     }
 
     /**
-     * 把长期停在 QUEUED 的全局轮询/唤醒重新排入 SCHEDULED。
+     * 把长期停在 QUEUED/RUNNING 的全局轮询/唤醒重新排入 SCHEDULED。
      *
-     * 只处理 GLOBAL_* 的 QUEUED：RUNNING 表示主任务确实在执行，MODULE_CHILD 由业务自行续接。
+     * 统一交给 [sweepStaleClaims]：它同时处理业务子任务的卡死认领，避免这些记录
+     * 一直挡着 [hasActiveModuleChild]，把主流程派发永久封死。
      */
     fun requeueStaleGlobalSchedules(now: Long = System.currentTimeMillis()): Int {
         if (now - lastStaleQueueSweepAtMs < STALE_QUEUE_SWEEP_INTERVAL_MS) return 0
         lastStaleQueueSweepAtMs = now
-        return try {
-            withRegistryLock {
-                if (!ensureStorage()) return@withRegistryLock 0
-                val schedules = loadMutable()
-                var requeued = 0
-                for (index in schedules.indices) {
-                    val schedule = schedules[index]
-                    if (!schedule.isGlobalKind() || schedule.state !in setOf(
-                            PersistentScheduleState.QUEUED,
-                            PersistentScheduleState.RUNNING,
-                        )
-                    ) {
-                        continue
-                    }
-                    val staleAfterMs = if (schedule.state == PersistentScheduleState.QUEUED) {
-                        STALE_GLOBAL_QUEUE_MS
-                    } else {
-                        STALE_GLOBAL_RUNNING_MS
-                    }
-                    if (now - schedule.updatedAtMs <= staleAfterMs) continue
-                    Log.record(
-                        TAG,
-                        "全局调度长期停在${schedule.state}，重新排队[${schedule.name}] id=${schedule.id} " +
-                            "停留=${(now - schedule.updatedAtMs) / 1000}s",
-                    )
-                    schedules[index] = schedule.copy(
-                        state = PersistentScheduleState.SCHEDULED,
-                        triggerAtMs = now + RECOVERY_RETRY_DELAY_MS,
-                        updatedAtMs = now,
-                        lastError = if (schedule.state == PersistentScheduleState.QUEUED) {
-                            "stale_queue_requeued"
-                        } else {
-                            "stale_running_requeued"
-                        },
-                    )
-                    requeued++
-                }
-                if (requeued > 0) save(schedules)
-                requeued
-            }
-        } catch (e: InterruptedException) {
-            throw e
-        } catch (e: Exception) {
-            Log.printStackTrace(TAG, "全局调度排队超时回收失败", e)
-            0
-        }
+        return sweepStaleClaims(now)
     }
 
     /**
@@ -370,9 +325,61 @@ object PersistentScheduleRegistry {
                 schedule.ownerUserId?.trim() == safeOwnerUserId &&
                 schedule.sessionEpoch == sessionEpoch &&
                 schedule.state in activeModuleChildStates &&
-                // 卡死的 QUEUED 记录不能让主流程派发永久停摆；RUNNING 仍按业务耗时判定。
-                !(schedule.state == PersistentScheduleState.QUEUED &&
-                    now - schedule.updatedAtMs > STALE_QUEUED_CHILD_MS)
+                // 卡死的 QUEUED/RUNNING 记录不能让主流程派发永久停摆。
+                // 实证：11-19 09:33 的轮询触发在 QUEUED 上挂了 52 分钟，期间主任务一次都没派发。
+                now - schedule.updatedAtMs <= schedule.staleClaimAfterMs()
+        }
+    }
+
+    /**
+     * 回收所有「认领了但再也没动静」的记录。
+     *
+     * 全局轮询/唤醒按调度链续接重新排队；业务子任务直接按失败收敛，因为它们已经错过业务窗口，
+     * 继续挂着只会一直挡住主流程派发。返回本次处理的条数。
+     */
+    fun sweepStaleClaims(now: Long = System.currentTimeMillis()): Int {
+        return try {
+            withRegistryLock {
+                if (!ensureStorage()) return@withRegistryLock 0
+                val schedules = loadMutable()
+                var changed = 0
+                for (index in schedules.indices) {
+                    val schedule = schedules[index]
+                    if (!schedule.isClaimed()) continue
+                    if (now - schedule.updatedAtMs <= schedule.staleClaimAfterMs()) continue
+                    val age = (now - schedule.updatedAtMs) / 1000
+                    schedules[index] = if (schedule.isGlobalKind()) {
+                        Log.record(
+                            TAG,
+                            "全局调度认领后无进展，重新排队[${schedule.name}] state=${schedule.state} 停留=${age}s",
+                        )
+                        schedule.copy(
+                            state = PersistentScheduleState.SCHEDULED,
+                            triggerAtMs = now + RECOVERY_RETRY_DELAY_MS,
+                            updatedAtMs = now,
+                            lastError = if (schedule.state == PersistentScheduleState.QUEUED) {
+                                "stale_queue_requeued"
+                            } else {
+                                "stale_running_requeued"
+                            },
+                        )
+                    } else {
+                        Log.record(
+                            TAG,
+                            "业务子任务认领后无进展，按失败收敛[${schedule.name}] state=${schedule.state} 停留=${age}s",
+                        )
+                        schedule.withFailure("stale_claim_released", now)
+                    }
+                    changed++
+                }
+                if (changed > 0) save(schedules)
+                changed
+            }
+        } catch (e: InterruptedException) {
+            throw e
+        } catch (e: Exception) {
+            Log.printStackTrace(TAG, "回收卡死认领记录失败", e)
+            0
         }
     }
 
@@ -1008,7 +1015,14 @@ object PersistentScheduleRegistry {
             if (index < 0) return@withRegistryLock
             val previous = schedules[index]
             val updated = updater(previous)
-            if (updated == previous) return@withRegistryLock
+            if (updated == previous) {
+                // 状态没变不代表闹钟还在：Queued->Scheduled 这类「看起来没变」的回滚
+                // 之前会直接返回，结果记录回到 SCHEDULED 却没有物理闹钟，整条链就此静默停摆。
+                // 实证：11-19 09:33 起轮询记录 QUEUED->SCHEDULED 后 52 分钟无人唤醒。
+                StoreAccess.afterTransaction { SystemWakeScheduler.onRegistryChanged() }
+                Log.runtime(TAG, "持久调度状态未变化，触发一次重排兜底[id=$id] source=$source")
+                return@withRegistryLock
+            }
             schedules[index] = updated
             save(schedules)
             if (previous.state != updated.state) {

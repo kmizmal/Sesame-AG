@@ -20,6 +20,8 @@ class ScheduleReconcileReceiver : BroadcastReceiver() {
         private const val RECEIVER_WAKELOCK_MS = 20_000L
         private const val ACTION_EXACT_ALARM_PERMISSION_CHANGED =
             "android.app.action.SCHEDULE_EXACT_ALARM_PERMISSION_STATE_CHANGED"
+        private const val ACTION_APP_STANDBY_BUCKET_CHANGED =
+            "android.app.action.APP_STANDBY_BUCKET_CHANGED"
         private val SUPPORTED_ACTIONS =
             setOf(
                 Intent.ACTION_BOOT_COMPLETED,
@@ -28,6 +30,9 @@ class ScheduleReconcileReceiver : BroadcastReceiver() {
                 Intent.ACTION_TIME_CHANGED,
                 Intent.ACTION_TIMEZONE_CHANGED,
                 ACTION_EXACT_ALARM_PERMISSION_CHANGED,
+                // 系统把应用踢出活跃桶时，进程内计时器与降级投递都会失去保障；
+                // 这是少数能在进程被杀后仍被拉起的系统机会，用它重新对齐闹钟。
+                ACTION_APP_STANDBY_BUCKET_CHANGED,
             )
         private val receiverScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     }

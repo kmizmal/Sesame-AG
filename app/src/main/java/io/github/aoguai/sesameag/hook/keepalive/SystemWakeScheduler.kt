@@ -75,8 +75,10 @@ object SystemWakeScheduler {
     fun schedule(context: Context, schedule: PersistentSchedule, silent: Boolean = false): Boolean = try {
         planner.execute {
             val appContext = context.applicationContext ?: context
-            // 重排前先回收长期停在 QUEUED 的全局调度，避免一次唤醒被静默吞掉。
-            PersistentScheduleRegistry.requeueStaleGlobalSchedules()
+            // 重排前先回收「认领了但没动静」的记录：全局调度续排，业务子任务按失败收敛。
+            // 卡住的子任务会让 hasActiveModuleChild 恒为真，主流程派发就彻底停摆。
+            // 无论有没有未执行的计划，重排本身也要按周期跑一次：记录可能停在 SCHEDULED 上但闹钟早已消失。
+            PersistentScheduleRegistry.sweepStaleClaims()
             val snapshot = PersistentScheduleRegistry.listFresh()
             val scheduled = snapshot.filter { it.state == PersistentScheduleState.SCHEDULED }
             val localScheduled = updateLocalTimer(appContext, scheduled)

@@ -17,6 +17,11 @@ object ApplicationHookCore {
 
     /** 全局触发排空：全局轮询/唤醒不会被主任务消费，必须单独清账，否则会永久占住触发队列。 */
     private val drainInFlight = AtomicBoolean(false)
+
+    /** 派发停摆的起点；0 表示当前不存在停摆。 */
+    @Volatile
+    private var stallSinceMs = 0L
+    private const val STALL_RELEASE_MS = 5 * 60 * 1000L
     @Volatile
     private var drainScheduledAtMs = 0L
     private const val DRAIN_RETRY_GAP_MS = 15 * 1000L
@@ -69,6 +74,61 @@ object ApplicationHookCore {
         dispatchRequested.set(true)
         scheduleDispatchIfPossible()
         scheduleGlobalTriggerDrain()
+        detectDispatchStall()
+    }
+
+    /**
+     * 派发停摆检测。
+     *
+     * 只要队列里有没被消费的普通触发、主任务没在跑、也没有活跃的业务子任务，
+     * 正常的派发路径就该立刻把它拿走。若这种状态持续 [STALL_RELEASE_MS]，说明某个门禁
+     * 一直没开放（实证：全局触发占着队列、主任务被离线中断后无人再派发），
+     * 此时把全局触发清掉并补登记，让主流程重新拿到一次执行机会。
+     */
+    private fun detectDispatchStall() {
+        val now = System.currentTimeMillis()
+        val pending = ApplicationHookConstants.pendingTriggerCount()
+        val mainRunning = ApplicationHook.mainTask?.isRunning == true
+        val childActive = PersistentScheduleRegistry.hasActiveModuleChild(
+            AccountSessionCoordinator.currentUserId(),
+            AccountSessionCoordinator.currentSessionEpoch(),
+        )
+        val eligible = pending > 0 && !mainRunning && !childActive
+        if (!eligible) {
+            stallSinceMs = 0L
+            return
+        }
+        if (stallSinceMs == 0L) {
+            stallSinceMs = now
+            return
+        }
+        if (now - stallSinceMs < STALL_RELEASE_MS) return
+        stallSinceMs = 0L
+        record(
+            TAG,
+            "派发停摆 $STALL_RELEASE_MS ms，主动清场并补一次执行: pending=$pending " +
+                ApplicationHook.readinessSummary(),
+        )
+        scheduleGlobalTriggerDrain()
+        // 停摆恢复只负责清场并补登记；真正的派发仍走那条经过各道门禁的路径，
+        // 这里直接调 scheduleDispatchIfPossible 会套娃回 dispatchIfNeeded 自己。
+        releaseStalledDispatch()
+    }
+
+    private fun releaseStalledDispatch() {
+        val drained = ApplicationHookConstants.removePendingTriggers("dispatch_stall_release") { trigger ->
+            trigger.type == TriggerType.ALARM_POLL ||
+                (trigger.type == TriggerType.ALARM_WAKEUP && !trigger.wakenAtTime)
+        }
+        drained.forEach { trigger ->
+            val scheduleId = trigger.persistentScheduleId?.takeIf { it.isNotBlank() } ?: return@forEach
+            PersistentScheduleRegistry.onGlobalTriggerDrained(
+                context = ApplicationHook.appContext,
+                scheduleId = scheduleId,
+                registerNextPoll = { ApplicationHook.reRegisterPollSchedule() },
+            )
+        }
+        record(TAG, "派发停摆清场完成 drained=${drained.size} pending=${ApplicationHookConstants.pendingTriggerCount()}")
     }
 
     private fun scheduleDispatchIfPossible() {
