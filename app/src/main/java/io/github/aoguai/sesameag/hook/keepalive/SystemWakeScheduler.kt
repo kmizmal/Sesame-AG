@@ -21,6 +21,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withTimeoutOrNull
 import io.github.aoguai.sesameag.util.SerialTaskQueue
@@ -71,9 +72,20 @@ object SystemWakeScheduler {
         timerScope.launch { refresh(context) }
     }
 
-    /** 两个精度通道互不阻挡；目标进程仅保留最近计划的一个轻量计时器。 */
     fun schedule(context: Context, schedule: PersistentSchedule, silent: Boolean = false): Boolean = try {
-        planner.execute {
+        // 登记完成后的物理重排有独立的生命周期，即使触发它的模块已被取消也要完成。
+        runBlocking { replan(context, schedule, silent) }
+    } catch (e: InterruptedException) {
+        timerScope.launch { refresh(context) }
+        throw e
+    } catch (e: Exception) {
+        Log.printStackTrace(TAG, "持久调度重排失败", e)
+        false
+    }
+
+    /** 两个精度通道互不阻挡；目标进程仅保留最近计划的一个轻量计时器。 */
+    private suspend fun replan(context: Context, schedule: PersistentSchedule, silent: Boolean): Boolean =
+        planner.submit {
             val appContext = context.applicationContext ?: context
             // 重排前先回收「认领了但没动静」的记录：全局调度续排，业务子任务按失败收敛。
             // 卡住的子任务会让 hasActiveModuleChild 恒为真，主流程派发就彻底停摆。
@@ -146,12 +158,6 @@ object SystemWakeScheduler {
             }
             systemScheduled || localScheduled
         }
-    } catch (e: InterruptedException) {
-        throw e
-    } catch (e: Exception) {
-        Log.printStackTrace(TAG, "持久调度重排失败", e)
-        false
-    }
 
     private fun laneFor(schedule: PersistentSchedule): Int =
         if (schedule.attemptCount > 0 || schedule.lastError in setOf("launch_pending", "delivery_pending") ||
